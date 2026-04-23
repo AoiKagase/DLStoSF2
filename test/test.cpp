@@ -403,8 +403,8 @@ void runTests() {
     require(sf2.instruments.size() == 1, "expected one sf2 instrument");
     require(sf2.presets[0].bank == 128, "expected drum bank mapping");
     require(!sf2.instrumentGenerators.empty(), "expected instrument generators");
-    require(sf2.samples[0].originalPitch == 64, "expected region wsmp root key override");
-    require(sf2.samples[0].pitchCorrection == 5, "expected region wsmp fine tune override");
+    require(sf2.samples[0].originalPitch == 61, "expected sample header to keep wave wsmp root key");
+    require(sf2.samples[0].pitchCorrection == -3, "expected sample header to keep wave wsmp fine tune");
 
     bool sawRootKey = false;
     bool sawAttenuation = false;
@@ -423,6 +423,7 @@ void runTests() {
     bool sawModEnvToPitch = false;
     bool sawModEnvToFilter = false;
     bool sawRootKey67 = false;
+    bool sawRegionFineTuneDelta = false;
     for (const auto& gen : sf2.instrumentGenerators) {
         if (gen.type == SF2GeneratorType::overridingRootKey && gen.amount == 64) {
             sawRootKey = true;
@@ -450,6 +451,9 @@ void runTests() {
         }
         if (gen.type == SF2GeneratorType::fineTune && gen.amount == 50) {
             sawFineTune = true;
+        }
+        if (gen.type == SF2GeneratorType::fineTune && gen.amount == 8) {
+            sawRegionFineTuneDelta = true;
         }
         if (gen.type == SF2GeneratorType::initialAttenuation && gen.amount == 2) {
             sawExtraAttenuation = true;
@@ -485,6 +489,7 @@ void runTests() {
     require(sawSustainVol, "expected sustainVolEnv generator");
     require(sawCoarseTune, "expected coarseTune generator");
     require(sawFineTune, "expected fineTune pitch split");
+    require(sawRegionFineTuneDelta, "expected region fineTune to be relative to sample header correction");
     require(sawExtraAttenuation, "expected gain/attenuation generator");
     require(sawReverbSend, "expected reverb send generator");
     require(sawModLfoToPitch, "expected modLFOToPitch generator");
@@ -699,6 +704,119 @@ void runTests() {
     require(loneLeftSf2.samples.size() == 1, "expected single sample");
     require(loneLeftSf2.samples[0].sampleType == 1, "expected unmatched left sample to fall back to mono");
     require(loneLeftSf2.samples[0].sampleLink == 0, "expected unmatched left sample to have no link");
+
+    DlsFile sharedRegionLoopDls;
+    sharedRegionLoopDls.poolTable.cues = {0};
+    sharedRegionLoopDls.waveOffsets = {0};
+    DlsWave sharedLoopWave;
+    sharedLoopWave.name = "SharedLoop";
+    sharedLoopWave.sampleData.resize(100);
+    sharedLoopWave.sampleInfo = DlsWaveSampleInfo{};
+    sharedLoopWave.sampleInfo->unityNote = 60;
+    sharedLoopWave.sampleInfo->fineTune = -2;
+    sharedLoopWave.sampleInfo->loopCount = 1;
+    sharedLoopWave.sampleInfo->loops.push_back({16, 0, 10, 20});
+    sharedRegionLoopDls.waves.push_back(sharedLoopWave);
+
+    DlsInstrument sharedLoopInstrument;
+    sharedLoopInstrument.name = "SharedLoopInst";
+    sharedLoopInstrument.program = 4;
+    DlsRegion firstSharedRegion;
+    firstSharedRegion.waveLink = DlsWaveLink{};
+    firstSharedRegion.waveLink->tableIndex = 0;
+    firstSharedRegion.sampleInfo = DlsWaveSampleInfo{};
+    firstSharedRegion.sampleInfo->unityNote = 61;
+    firstSharedRegion.sampleInfo->fineTune = 1;
+    firstSharedRegion.sampleInfo->loopCount = 1;
+    firstSharedRegion.sampleInfo->loops.push_back({16, 0, 12, 18});
+    sharedLoopInstrument.regions.push_back(firstSharedRegion);
+
+    DlsRegion secondSharedRegion = firstSharedRegion;
+    secondSharedRegion.sampleInfo->unityNote = 62;
+    secondSharedRegion.sampleInfo->fineTune = -4;
+    secondSharedRegion.sampleInfo->loops.clear();
+    secondSharedRegion.sampleInfo->loops.push_back({16, 0, 30, 15});
+    sharedLoopInstrument.regions.push_back(secondSharedRegion);
+    sharedRegionLoopDls.instruments.push_back(sharedLoopInstrument);
+
+    const SF2File sharedRegionLoopSf2 = converter.convert(sharedRegionLoopDls);
+    require(sharedRegionLoopSf2.samples[0].originalPitch == 60,
+            "expected shared sample header to keep wave-level pitch");
+    require(sharedRegionLoopSf2.samples[0].pitchCorrection == -2,
+            "expected shared sample header to keep wave-level fine tune");
+    require(sharedRegionLoopSf2.samples[0].loopStart == 10,
+            "expected shared sample header to keep wave-level loop start");
+    require(sharedRegionLoopSf2.samples[0].loopEnd == 30,
+            "expected shared sample header to keep wave-level loop end");
+
+    size_t sharedLoopModeCount = 0;
+    bool sawFirstRegionLoopOffset = false;
+    bool sawSecondRegionStartLoopOffset = false;
+    bool sawSecondRegionEndLoopOffset = false;
+    bool sawFirstRegionFineTuneDelta = false;
+    bool sawSecondRegionFineTuneDelta = false;
+    bool sawFirstRegionRootKey = false;
+    bool sawSecondRegionRootKey = false;
+    for (const auto& gen : sharedRegionLoopSf2.instrumentGenerators) {
+        if (gen.type == SF2GeneratorType::sampleModes && gen.amount == 1) {
+            ++sharedLoopModeCount;
+        }
+        if (gen.type == SF2GeneratorType::startloopAddrsOffset && gen.amount == 2) {
+            sawFirstRegionLoopOffset = true;
+        }
+        if (gen.type == SF2GeneratorType::startloopAddrsOffset && gen.amount == 20) {
+            sawSecondRegionStartLoopOffset = true;
+        }
+        if (gen.type == SF2GeneratorType::endloopAddrsOffset && gen.amount == 15) {
+            sawSecondRegionEndLoopOffset = true;
+        }
+        if (gen.type == SF2GeneratorType::fineTune && gen.amount == 3) {
+            sawFirstRegionFineTuneDelta = true;
+        }
+        if (gen.type == SF2GeneratorType::fineTune && gen.amount == -2) {
+            sawSecondRegionFineTuneDelta = true;
+        }
+        if (gen.type == SF2GeneratorType::overridingRootKey && gen.amount == 61) {
+            sawFirstRegionRootKey = true;
+        }
+        if (gen.type == SF2GeneratorType::overridingRootKey && gen.amount == 62) {
+            sawSecondRegionRootKey = true;
+        }
+    }
+    require(sharedLoopModeCount == 2, "expected both shared-wave regions to remain looped");
+    require(sawFirstRegionLoopOffset, "expected first region start loop offset");
+    require(sawSecondRegionStartLoopOffset, "expected second region start loop offset");
+    require(sawSecondRegionEndLoopOffset, "expected second region end loop offset");
+    require(sawFirstRegionFineTuneDelta, "expected first region fine tune delta");
+    require(sawSecondRegionFineTuneDelta, "expected second region fine tune delta");
+    require(sawFirstRegionRootKey, "expected first region root key");
+    require(sawSecondRegionRootKey, "expected second region root key");
+
+    DlsFile invalidLoopDls;
+    invalidLoopDls.poolTable.cues = {0};
+    invalidLoopDls.waveOffsets = {0};
+    DlsWave invalidLoopWave;
+    invalidLoopWave.name = "InvalidLoop";
+    invalidLoopWave.sampleData.resize(10);
+    invalidLoopWave.sampleInfo = DlsWaveSampleInfo{};
+    invalidLoopWave.sampleInfo->loopCount = 1;
+    invalidLoopWave.sampleInfo->loops.push_back({16, 0, 5, 0});
+    invalidLoopDls.waves.push_back(invalidLoopWave);
+    DlsInstrument invalidLoopInstrument;
+    invalidLoopInstrument.name = "InvalidLoopInst";
+    DlsRegion invalidLoopRegion;
+    invalidLoopRegion.waveLink = DlsWaveLink{};
+    invalidLoopRegion.waveLink->tableIndex = 0;
+    invalidLoopInstrument.regions.push_back(invalidLoopRegion);
+    invalidLoopDls.instruments.push_back(invalidLoopInstrument);
+    const SF2File invalidLoopSf2 = converter.convert(invalidLoopDls);
+    bool sawInvalidLoopSampleMode = false;
+    for (const auto& gen : invalidLoopSf2.instrumentGenerators) {
+        if (gen.type == SF2GeneratorType::sampleModes) {
+            sawInvalidLoopSampleMode = true;
+        }
+    }
+    require(!sawInvalidLoopSampleMode, "expected invalid loop to avoid sampleModes");
 
     DlsFile oneShotDls;
     oneShotDls.poolTable.cues = {0};

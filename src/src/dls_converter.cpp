@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <unordered_map>
@@ -93,11 +94,47 @@ struct ArticulationConversion {
     std::vector<SF2Modulator> modulators;
 };
 
+struct LoopRange {
+    uint32_t start = 0;
+    uint32_t end = 0;
+};
+
 int16_t oneShotReleaseTimecents(const DlsWave& wave) {
     const uint32_t sampleRate = wave.sampleRate == 0 ? 44100 : wave.sampleRate;
     const double sampleSeconds = std::max(0.01, static_cast<double>(wave.sampleData.size()) / sampleRate);
     const double releaseSeconds = std::clamp(sampleSeconds * 8.0, 2.0, 16.0);
     return internal::clampI16(static_cast<int32_t>(std::lround(1200.0 * std::log2(releaseSeconds))));
+}
+
+std::optional<LoopRange> supportedLoopRange(const DlsWaveLoop& loop, const DlsWave& wave) {
+    if (loop.loopType != 0 || loop.loopLength == 0) {
+        return std::nullopt;
+    }
+
+    const uint64_t start = loop.loopStart;
+    const uint64_t end = start + loop.loopLength;
+    if (end <= start || end > wave.sampleData.size()) {
+        return std::nullopt;
+    }
+
+    return LoopRange{static_cast<uint32_t>(start), static_cast<uint32_t>(end)};
+}
+
+std::optional<LoopRange> firstSupportedLoopRange(const DlsWaveSampleInfo& sampleInfo, const DlsWave& wave,
+                                                 ConversionReport* report = nullptr) {
+    if (sampleInfo.loops.empty()) {
+        return std::nullopt;
+    }
+
+    auto range = supportedLoopRange(sampleInfo.loops.front(), wave);
+    if (!range && report != nullptr) {
+        report->approximatedMappings["invalid or unsupported DLS loop ignored"]++;
+    }
+    return range;
+}
+
+bool fitsSf2Offset(int64_t value) {
+    return value >= std::numeric_limits<int16_t>::min() && value <= std::numeric_limits<int16_t>::max();
 }
 
 void addLoopApproximationWarnings(const DlsRegion& region, const DlsWave& wave, ConversionReport& report) {
@@ -133,6 +170,7 @@ ArticulationConversion convertArticulationWithReport(const DlsArticulation& art,
 }
 
 std::vector<SF2Generator> effectiveRegionGenerators(const DlsRegion& region, const DlsWave& wave,
+                                                    const LoopRange& sampleBaseLoop, int8_t samplePitchCorrection,
                                                     ConversionReport& report) {
     std::vector<SF2Generator> generators;
     const DlsWaveSampleInfo* wsmp = internal::effectiveWsmp(region, wave);
@@ -152,12 +190,28 @@ std::vector<SF2Generator> effectiveRegionGenerators(const DlsRegion& region, con
         }
         if (region.sampleInfo) {
             generators.push_back({SF2GeneratorType::overridingRootKey, static_cast<int16_t>(merged.unityNote)});
-            if (merged.fineTune != 0) {
-                generators.push_back({SF2GeneratorType::fineTune, merged.fineTune});
+            const int16_t fineTuneDelta = internal::clampI16(
+                static_cast<int32_t>(merged.fineTune) - static_cast<int32_t>(samplePitchCorrection));
+            if (fineTuneDelta != 0) {
+                generators.push_back({SF2GeneratorType::fineTune, fineTuneDelta});
             }
         }
-        if (!merged.loops.empty()) {
+        const auto effectiveLoop = firstSupportedLoopRange(merged, wave, &report);
+        if (effectiveLoop) {
             generators.push_back({SF2GeneratorType::sampleModes, 1});
+            const int64_t startOffset = static_cast<int64_t>(effectiveLoop->start) - sampleBaseLoop.start;
+            const int64_t endOffset = static_cast<int64_t>(effectiveLoop->end) - sampleBaseLoop.end;
+            if (fitsSf2Offset(startOffset) && fitsSf2Offset(endOffset)) {
+                if (startOffset != 0) {
+                    generators.push_back(
+                        {SF2GeneratorType::startloopAddrsOffset, static_cast<int16_t>(startOffset)});
+                }
+                if (endOffset != 0) {
+                    generators.push_back({SF2GeneratorType::endloopAddrsOffset, static_cast<int16_t>(endOffset)});
+                }
+            } else {
+                report.unrepresentableGenerators["region loop offset outside SF2 int16 range"]++;
+            }
         }
     }
 
@@ -168,7 +222,7 @@ std::vector<SF2Generator> effectiveRegionGenerators(const DlsRegion& region, con
     const auto artConversion = convertArticulationWithReport(region.articulation, report);
     generators.insert(generators.end(), artConversion.generators.begin(), artConversion.generators.end());
 
-    const bool hasLoop = mergedWsmp.has_value() && !mergedWsmp->loops.empty();
+    const bool hasLoop = mergedWsmp.has_value() && firstSupportedLoopRange(*mergedWsmp, wave).has_value();
     const bool selfNonExclusive = (region.header.options & internal::DLS_RGN_OPTION_SELFNONEXCLUSIVE) != 0;
     const bool hasExplicitRelease =
         std::any_of(artConversion.generators.begin(), artConversion.generators.end(),
@@ -207,8 +261,9 @@ SF2File Converter::convert(const DlsFile& dls) const {
     sf2.ICOP = dls.info.copyright;
     sf2.IROM = "DLS";
 
-    std::vector<uint16_t> waveToSampleIndex(dls.waves.size(), 0);
     ConversionReport report;
+    std::vector<uint16_t> waveToSampleIndex(dls.waves.size(), 0);
+    std::vector<bool> sampleHasBaseLoop(dls.waves.size(), false);
     for (size_t i = 0; i < dls.waves.size(); ++i) {
         const auto& wave = dls.waves[i];
         if (wave.channels > 1) {
@@ -221,10 +276,11 @@ SF2File Converter::convert(const DlsFile& dls) const {
         if (wave.sampleInfo) {
             sample.originalPitch = static_cast<uint8_t>(wave.sampleInfo->unityNote);
             sample.pitchCorrection = clampI8(wave.sampleInfo->fineTune);
-            if (!wave.sampleInfo->loops.empty()) {
-                const DlsWaveLoop& loop = wave.sampleInfo->loops.front();
-                sample.loopStart = loop.loopStart;
-                sample.loopEnd = loop.loopStart + loop.loopLength;
+            const auto loop = firstSupportedLoopRange(*wave.sampleInfo, wave, &report);
+            if (loop) {
+                sample.loopStart = loop->start;
+                sample.loopEnd = loop->end;
+                sampleHasBaseLoop[i] = true;
             }
         }
         sf2.samples.push_back(sample);
@@ -251,12 +307,11 @@ SF2File Converter::convert(const DlsFile& dls) const {
             const DlsWaveSampleInfo* wsmp = effectiveWsmp(region, dls.waves[waveIt->second]);
             if (wsmp != nullptr) {
                 const DlsWaveSampleInfo merged = mergedWsmp(region, dls.waves[waveIt->second]);
-                sf2.samples[waveIt->second].originalPitch = static_cast<uint8_t>(merged.unityNote);
-                sf2.samples[waveIt->second].pitchCorrection = clampI8(merged.fineTune);
-                if (!merged.loops.empty()) {
-                    sf2.samples[waveIt->second].loopStart = merged.loops.front().loopStart;
-                    sf2.samples[waveIt->second].loopEnd =
-                        merged.loops.front().loopStart + merged.loops.front().loopLength;
+                const auto loop = firstSupportedLoopRange(merged, dls.waves[waveIt->second], &report);
+                if (loop && !sampleHasBaseLoop[waveIt->second]) {
+                    sf2.samples[waveIt->second].loopStart = loop->start;
+                    sf2.samples[waveIt->second].loopEnd = loop->end;
+                    sampleHasBaseLoop[waveIt->second] = true;
                 }
             }
         }
@@ -334,13 +389,19 @@ SF2File Converter::convert(const DlsFile& dls) const {
             }
             const uint32_t waveIndex = waveIt->second;
             addLoopApproximationWarnings(region, dls.waves[waveIndex], report);
+            const LoopRange sampleBaseLoop =
+                sampleHasBaseLoop[waveIndex]
+                    ? LoopRange{sf2.samples[waveIndex].loopStart, sf2.samples[waveIndex].loopEnd}
+                    : LoopRange{static_cast<uint32_t>(dls.waves[waveIndex].sampleData.size()),
+                                static_cast<uint32_t>(dls.waves[waveIndex].sampleData.size())};
 
             SF2InstrumentBag bag;
             bag.genIndex = static_cast<uint16_t>(sf2.instrumentGenerators.size());
             bag.modIndex = static_cast<uint16_t>(sf2.instrumentModulators.size());
             sf2.instrumentBags.push_back(bag);
 
-            auto generators = effectiveRegionGenerators(region, dls.waves[waveIndex], report);
+            auto generators = effectiveRegionGenerators(region, dls.waves[waveIndex], sampleBaseLoop,
+                                                        sf2.samples[waveIndex].pitchCorrection, report);
             generators.push_back({SF2GeneratorType::sampleID, static_cast<int16_t>(waveToSampleIndex[waveIndex])});
             sf2.instrumentGenerators.insert(sf2.instrumentGenerators.end(), generators.begin(), generators.end());
 
